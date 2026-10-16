@@ -1,6 +1,6 @@
 first requirements.txt
 
-livekit install  from "livekit_1.13.10_windows_amd64.zip" https://github.com/livekit/livekit/releases
+livekit install   "livekit_1.13.10_windows_amd64.zip" from https://github.com/livekit/livekit/releases
 
 tools\livekit-server.exe --dev
  nest terminal -> python -m backend.agent download-files
