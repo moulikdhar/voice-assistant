@@ -1,0 +1,26 @@
+first requirements.txt
+
+
+
+tools\livekit-server.exe --dev
+
+.venv\Scripts\activate
+python run.py
+
+cd frontend
+npm run dev
+
+information :
+
+Voxtral Realtime : the ears. Turns the caller's voice into text, live, while they speak.
+Mistral Large : the brain. Reads what the caller said and decides what the AI says next. After the call it also writes the summary.
+Voxtral TTS : the mouth. Turns the AI's reply into a natural human voice.
+
+ LiveKit (the plumbing, open source) 
+ LiveKit server  (`livekit-server.exe`): the phone line. Carries live audio between the caller's browser and the AI.
+ LiveKit Agents : the call manager. Decides when the caller has finished talking, when the AI may speak, and stops the AI when the caller interrupts (barge-in).
+ livekit-plugins-mistralai : the connector. Plugs the three Mistral models into LiveKit Agents.
+ livekit-client  (browser): connects the phone screen to the phone line: sends your mic, plays the AI's voice.
+
+ Silero VAD (small free model) 
+ The speech detector. Tells LiveKit "a human is speaking right now" or "silence", which drives turn-taking and barge-in.

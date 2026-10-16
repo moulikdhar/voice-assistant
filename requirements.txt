@@ -1,0 +1,14 @@
+# ── Voice AI agent (LiveKit Agents framework + Mistral plugin) ──
+livekit-agents==1.8.8            # agent framework: rooms, turn-taking, barge-in
+livekit-plugins-mistralai==1.8.8 # Voxtral Realtime (STT), Voxtral TTS, Mistral LLM
+livekit-plugins-silero==1.8.8    # VAD: detects when the caller stops speaking
+livekit-api==1.2.2               # create tokens, dispatch agents, delete rooms
+
+# ── Mistral SDK (used directly for the post-call summary) ──
+mistralai==2.10.1
+
+# ── Backend web server (call controller + console events) ──
+fastapi==0.143.2
+uvicorn[standard]==0.53.0
+httpx==0.28.1                    # agent -> backend event reporting
+python-dotenv==1.2.3             # loads MISTRAL_API_KEY from .env

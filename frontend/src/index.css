@@ -1,0 +1,71 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply bg-zinc-950 text-zinc-100 antialiased;
+}
+
+/* Thin scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgb(63 63 70) transparent;
+}
+
+/* LiveKit BarVisualizer (unstyled by default): we style its bars here */
+.lk-audio-bar-visualizer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  height: 100%;
+  width: 100%;
+}
+.lk-audio-bar {
+  width: 7px;
+  min-height: 7px;
+  border-radius: 9999px;
+  background: rgb(255 255 255 / 0.18);
+  transition: background-color 0.2s ease, height 0.08s linear;
+}
+.lk-audio-bar[data-lk-highlighted="true"] {
+  background: rgb(52 211 153);
+}
+.lk-audio-bar-visualizer[data-lk-va-state="thinking"] .lk-audio-bar[data-lk-highlighted="true"] {
+  background: rgb(251 191 36);
+}
+
+/* Blinking caret for text that is still being spoken */
+.caret::after {
+  content: "▍";
+  margin-left: 2px;
+  animation: blink 1s steps(2, start) infinite;
+  opacity: 0.7;
+}
+@keyframes blink {
+  to {
+    visibility: hidden;
+  }
+}
+
+/* Highlight a transcript line when clicked from the summary evidence */
+.flash {
+  animation: flash 1.6s ease-out;
+}
+@keyframes flash {
+  0% {
+    box-shadow: 0 0 0 2px rgb(250 204 21);
+  }
+  100% {
+    box-shadow: 0 0 0 2px transparent;
+  }
+}
