@@ -1,8 +1,11 @@
 .env
 .venv/
 __pycache__/
-calls/*.json
+data/
+calls/*
+!calls/.gitkeep
 frontend/node_modules/
 frontend/dist/
 *.tsbuildinfo
 tools/livekit-server.exe
+_backup_*/

@@ -1,11 +1,4 @@
-"""
-Starts the two Python parts together in ONE terminal:
-  - Backend  (FastAPI call controller)  -> http://127.0.0.1:8000
-  - AI Agent (LiveKit Agents worker that talks to Mistral)
 
-Usage (with the venv activated):   python run.py
-Stop with Ctrl+C.
-"""
 
 import subprocess
 import sys
@@ -32,6 +25,12 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nStopping...")
     finally:
+        # Ctrl+C already reached both programs: give them a moment to save the call (WAV, summary) first
+        for p in running.values():
+            try:
+                p.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                pass
         for p in running.values():
             if p.poll() is None:
                 p.terminate()

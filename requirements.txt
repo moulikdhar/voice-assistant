@@ -1,13 +1,19 @@
+# Backend + voice agent. Everything here is open source (Apache 2.0 / MIT / BSD).
+# Only paid service: your Mistral API key (the product we are showcasing).
+
 # ── Voice AI agent (LiveKit Agents framework + Mistral plugin) ──
-livekit-agents==1.8.8            # agent framework: rooms, turn-taking, barge-in
+livekit-agents[mcp]==1.8.8       # agent framework: rooms, turn-taking, barge-in, MCP tool client
 livekit-plugins-mistralai==1.8.8 # Voxtral Realtime (STT), Voxtral TTS, Mistral LLM
 livekit-plugins-silero==1.8.8    # VAD: detects when the caller stops speaking
 livekit-api==1.2.2               # create tokens, dispatch agents, delete rooms
 
-# ── Mistral SDK (used directly for the post-call summary) ──
+# ── Bank tools exposed to the agent (Model Context Protocol server) ──
+mcp==2.2.0
+
+# ── Mistral SDK (Transcribe V2 batch, Mistral Large JSON: summary, assist, brief) ──
 mistralai==2.10.1
 
-# ── Backend web server (call controller + console events) ──
+# ── Backend web server (call controller + live events + claims API) ──
 fastapi==0.143.2
 uvicorn[standard]==0.53.0
 httpx==0.28.1                    # agent -> backend event reporting

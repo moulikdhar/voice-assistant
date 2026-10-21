@@ -2,138 +2,165 @@
 
 from __future__ import annotations
 
+from . import winssl  # noqa: F401  (Windows: cache the certificate store, see winssl.py)
+
 import asyncio
+import contextlib
 import json
 import logging
 import random
 import time
 from datetime import datetime
-from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from livekit import api
 from pydantic import BaseModel
 
-from . import config
+from . import assist, bank, brief, claims, config, db, hub, llm, playbooks, sim_specialist, state
+from .mcp_tools import mcp, send_sms
+from .state import Call
+from .summarizer import summarize
 
 log = logging.getLogger("server")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title="Voice-Led Claims – Call Controller")
-app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
-)
-
-Status = Literal["ringing", "connecting", "active", "wrapping_up", "ended", "missed", "declined"]
+mcp_app = mcp.streamable_http_app(streamable_http_path="/", stateless_http=True, json_response=True)
 
 
-# ─────────────────────────── in-memory state ───────────────────────────
-class Call(BaseModel):
-    call_id: str
-    room: str
-    caller_name: str
-    caller_number: str
-    status: Status = "ringing"
-    created_at: float
-    answered_at: float | None = None
-    ended_at: float | None = None
-    agent_state: str | None = None
-    user_state: str | None = None
-    lines: list[dict] = []
-    live: dict[str, str] = {}  # {"customer": "...", "ai": "..."} text still being spoken
-    summary: dict | None = None
-    file: str | None = None
-    error: str | None = None
+_bg: set[asyncio.Task] = set()
 
 
-calls: dict[str, Call] = {}
-settings: dict[str, Any] = {"auto_answer": True, "ring_seconds": config.RING_SECONDS}
-consoles: set[WebSocket] = set()
+def spawn(coro) -> asyncio.Task:
+    """create_task that keeps a reference (asyncio may otherwise garbage-collect a running task)."""
+    t = asyncio.create_task(coro)
+    _bg.add(t)
+    t.add_done_callback(_bg.discard)
+    return t
 
 
-async def broadcast(event: dict) -> None:
-    dead = []
-    for ws in consoles:
-        try:
-            await ws.send_text(json.dumps(event))
-        except Exception:
-            dead.append(ws)
-    for ws in dead:
-        consoles.discard(ws)
+@contextlib.asynccontextmanager
+async def lifespan(_app: FastAPI):
+    bank.seed()
+    state.load()
+    # build the Mistral client now (TLS certificate loading is slow on Windows), not at the first handover
+    await asyncio.to_thread(llm.client)
+    async with mcp.session_manager.run():
+        yield
 
 
-async def push_call(call: Call) -> None:
-    await broadcast({"type": "call.updated", "call": call.model_dump()})
+class _QuietHarmless(logging.Filter):
+    """Hide harmless library chatter in the terminal (LiveKit data streams we don't use, MCP session ends)."""
+    NOISE = ("ignoring text stream with topic", "ignoring byte stream with topic", "Terminating session",
+             "error putting to queue: Event loop is closed")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not any(n in msg for n in self.NOISE)
+
+
+for _name in ("", "root", "livekit", "mcp", "mcp.server.streamable_http"):
+    logging.getLogger(_name).addFilter(_QuietHarmless())
+logging.getLogger("mcp").setLevel(logging.WARNING)
+
+app = FastAPI(title="Voice-Led Claims POC", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.mount("/mcp", mcp_app)
+
+settings: dict = {"auto_answer": True, "auto_specialist": True, "ring_seconds": config.RING_SECONDS,
+                  "jurisdiction": config.JURISDICTION}
+
+# Approximate list prices (USD) for the "cost per claim" success measure. Override in .env if needed.
+PRICES = {
+    "stt_realtime_per_min": 0.006,
+    "stt_batch_per_min": 0.003,
+    "tts_per_1k_chars": 0.016,
+    "llm_input_per_m": 0.5,
+    "llm_output_per_m": 1.5,
+}
 
 
 def lk_api() -> api.LiveKitAPI:
-    # LiveKit's server API wants http(s)://, the browser wants ws(s)://
     url = config.LIVEKIT_URL.replace("ws://", "http://").replace("wss://", "https://")
     return api.LiveKitAPI(url, config.LIVEKIT_API_KEY, config.LIVEKIT_API_SECRET)
 
 
-def new_call_id() -> str:
-    return f"CALL-{datetime.now():%Y%m%d-%H%M%S}-{random.randint(100, 999)}"
+def token(identity: str, name: str, room: str) -> str:
+    return (
+        api.AccessToken(config.LIVEKIT_API_KEY, config.LIVEKIT_API_SECRET)
+        .with_identity(identity)
+        .with_name(name)
+        .with_grants(api.VideoGrants(room_join=True, room=room))
+        .to_jwt()
+    )
 
 
-# ─────────────────────────── REST API ───────────────────────────
+def _get(call_id: str) -> Call:
+    if call_id not in state.calls:
+        raise HTTPException(404, "unknown call")
+    return state.calls[call_id]
+
+
+# ─────────────────────────── calls ───────────────────────────
 class StartCall(BaseModel):
-    caller_name: str = "Riya Sharma"
+    caller_name: str = "Amit Sharma"
     caller_number: str = "+91 98765 43210"
 
 
 @app.post("/api/calls")
 async def start_call(body: StartCall):
-    """Customer presses the green call button."""
-    call_id = new_call_id()
+    """Customer presses the green call button. A known caller with an existing claim -> Status Agent."""
+    call_id = f"CALL-{datetime.now():%Y%m%d-%H%M%S}-{random.randint(100, 999)}"
+    cust = bank.customer_by_phone(body.caller_number)
+    existing = claims.for_customer(cust["id"]) if cust else None
     call = Call(
         call_id=call_id,
         room=f"room-{call_id}",
         caller_name=body.caller_name,
         caller_number=body.caller_number,
         created_at=time.time(),
+        customer_id=cust["id"] if cust else None,
+        mode="status" if existing else "intake",
+        claim_id=existing["id"] if existing else None,
     )
-    calls[call_id] = call
-
-    token = (
-        api.AccessToken(config.LIVEKIT_API_KEY, config.LIVEKIT_API_SECRET)
-        .with_identity(f"customer-{call_id}")
-        .with_name(body.caller_name)
-        .with_grants(api.VideoGrants(room_join=True, room=call.room))
-        .to_jwt()
-    )
-    await push_call(call)
-
+    state.calls[call_id] = call
+    await state.push(call)
+    if existing:
+        await claims.attach_call(existing["id"], call_id)
     if settings["auto_answer"]:
-        asyncio.create_task(_auto_answer(call_id, settings["ring_seconds"]))
-
-    return {"call": call.model_dump(), "livekit_url": config.LIVEKIT_URL, "token": token}
+        spawn(_auto_answer(call_id, settings["ring_seconds"]))
+    return {
+        "call": state.public(call),
+        "livekit_url": config.LIVEKIT_URL,
+        "token": token(f"customer-{call_id}", body.caller_name, call.room),
+    }
 
 
 async def _auto_answer(call_id: str, delay: float) -> None:
     await asyncio.sleep(delay)
-    call = calls.get(call_id)
+    call = state.calls.get(call_id)
     if call and call.status == "ringing":
         await _dispatch_agent(call)
 
 
 async def _dispatch_agent(call: Call) -> None:
     call.status = "connecting"
-    await push_call(call)
+    await state.push(call)
+    cl = claims.get(call.claim_id) if call.claim_id else None
     lk = lk_api()
     try:
         await lk.agent_dispatch.create_dispatch(
             api.CreateAgentDispatchRequest(
                 agent_name=config.AGENT_NAME,
                 room=call.room,
-                metadata=json.dumps(
-                    {
-                        "call_id": call.call_id,
-                        "caller_name": call.caller_name,
-                        "caller_number": call.caller_number,
-                    }
-                ),
+                metadata=json.dumps({
+                    "call_id": call.call_id,
+                    "caller_name": call.caller_name,
+                    "caller_number": call.caller_number,
+                    "mode": call.mode,
+                    "claim_ref": cl["reference"] if cl else None,
+                }),
             )
         )
     finally:
@@ -142,12 +169,11 @@ async def _dispatch_agent(call: Call) -> None:
 
 @app.post("/api/calls/{call_id}/answer")
 async def answer_call(call_id: str):
-    """Console clicks 'Answer with AI'."""
     call = _get(call_id)
     if call.status != "ringing":
         raise HTTPException(409, f"call is {call.status}")
     await _dispatch_agent(call)
-    return call.model_dump()
+    return state.public(call)
 
 
 @app.post("/api/calls/{call_id}/decline")
@@ -155,23 +181,31 @@ async def decline_call(call_id: str):
     call = _get(call_id)
     if call.status == "ringing":
         call.status, call.ended_at = "declined", time.time()
-        await push_call(call)
+        await state.push(call)
         await _delete_room(call)
-    return call.model_dump()
+    return state.public(call)
 
 
 @app.post("/api/calls/{call_id}/hangup")
 async def hangup_call(call_id: str):
-    """Customer hangs up, or console ends the call."""
     call = _get(call_id)
     if call.status in ("ringing", "connecting"):
-        call.status = "missed"  # hung up before the AI picked up
+        call.status = "missed"
     elif call.status == "active":
-        call.status = "wrapping_up"  # agent is saving transcript + summary
+        call.status = "wrapping_up"  # the agent reports call.ended, then we save + summarise
+        spawn(_finalize_watchdog(call_id))
     call.ended_at = call.ended_at or time.time()
-    await push_call(call)
+    await state.push(call)
     await _delete_room(call)
-    return call.model_dump()
+    return state.public(call)
+
+
+async def _finalize_watchdog(call_id: str) -> None:
+    """If the agent never reports the end (crash), finalize anyway."""
+    await asyncio.sleep(20)
+    call = state.calls.get(call_id)
+    if call and call.status == "wrapping_up" and not call.file:
+        await finalize(call, {"end_reason": "watchdog"})
 
 
 async def _delete_room(call: Call) -> None:
@@ -184,61 +218,119 @@ async def _delete_room(call: Call) -> None:
         await lk.aclose()
 
 
-@app.get("/api/calls")
-async def list_calls():
-    return [c.model_dump() for c in sorted(calls.values(), key=lambda c: -c.created_at)]
+# ─────────────────────────── Step 2: specialist joins ───────────────────────────
+@app.post("/api/calls/{call_id}/specialist")
+async def specialist_join(call_id: str, name: str = "Fraud Specialist"):
+    call = _get(call_id)
+    if call.status != "active":
+        raise HTTPException(409, f"call is {call.status}")
+    call.phase = "interview"
+    await state.push(call)
+    if call.mode == "intake" and call.claim_id and (cl := claims.get(call.claim_id)):
+        cl["status"] = "interview"
+        cl["steps"]["interview"] = "in_progress"
+        await claims.save(cl)
+    call.specialist = {"mode": "human", "name": name, "status": "on call"}
+    await state.push(call)
+    await claims.audit("specialist", "interview.joined", f"{name} joined the call (warm handover)",
+                       call_id=call_id, claim_id=call.claim_id)
+    return {"livekit_url": config.LIVEKIT_URL, "token": token(f"specialist-{call_id}", name, call.room),
+            "call": state.public(call)}
 
 
-@app.get("/api/calls/{call_id}/record")
-async def call_record(call_id: str):
-    """The saved JSON file (transcript + summary)."""
-    path = config.CALLS_DIR / f"{call_id}.json"
-    if not path.exists():
-        raise HTTPException(404, "not saved yet")
-    return json.loads(path.read_text(encoding="utf-8"))
+@app.post("/api/calls/{call_id}/simulate-specialist")
+async def simulate_specialist(call_id: str):
+    """Demo helper: an AI plays the human specialist (Mistral Large + a second Voxtral voice)."""
+    call = _get(call_id)
+    if call.status != "active" or call.phase not in ("handover", "interview"):
+        raise HTTPException(409, "the AI has not handed this call over yet")
+    if call.specialist and call.specialist.get("mode") == "human":
+        raise HTTPException(409, "a human specialist is already on the call")
+    call.phase = "interview"
+    call.specialist = {"mode": "simulated", "name": sim_specialist.NAME, "status": "joining"}
+    await state.push(call)
+    if call.mode == "intake" and call.claim_id and (cl := claims.get(call.claim_id)):
+        cl["status"] = "interview"
+        cl["steps"]["interview"] = "in_progress"
+        await claims.save(cl)
+    sim_specialist.start(call_id)
+    return state.public(call)
 
 
-@app.get("/api/history")
-async def history():
-    """All saved calls on disk (survives server restarts)."""
-    out = []
-    for p in sorted(config.CALLS_DIR.glob("CALL-*.json"), reverse=True):
-        try:
-            d = json.loads(p.read_text(encoding="utf-8"))
-            out.append(
-                {
-                    "call_id": d["call_id"],
-                    "caller": d.get("caller"),
-                    "started_at": d.get("started_at"),
-                    "duration_seconds": d.get("duration_seconds"),
-                    "short_summary": (d.get("summary") or {}).get("short_summary"),
-                }
-            )
-        except Exception:
-            continue
-    return out
+@app.post("/api/calls/{call_id}/end-interview")
+async def end_interview(call_id: str):
+    call = _get(call_id)
+    sim_specialist.stop(call_id)
+    await claims.audit("specialist", "interview.ended", "Interview finished, call ended by specialist",
+                       call_id=call_id, claim_id=call.claim_id)
+    return await hangup_call(call_id)
 
 
-class Settings(BaseModel):
-    auto_answer: bool | None = None
-    ring_seconds: float | None = None
+# ─────────────────────────── finalize a call ───────────────────────────
+async def finalize(call: Call, info: dict) -> None:
+    if call.file:  # already finalized by the watchdog: still keep the recording / usage that arrived late
+        if info.get("audio_file") and not call.audio_file:
+            call.audio_file = info["audio_file"]
+        if info.get("usage") and not call.metrics.get("usage"):
+            call.metrics["usage"] = info["usage"]
+            call.metrics["cost_usd"] = _cost(info["usage"])
+        await state.push(call)
+        return
+    call.status = "wrapping_up"
+    call.audio_file = info.get("audio_file") or call.audio_file
+    if info.get("usage"):
+        call.metrics["usage"] = info["usage"]
+        call.metrics["cost_usd"] = _cost(info["usage"])
+    call.ended_at = call.ended_at or time.time()
+    call.file = f"{call.call_id}.json"
+    await state.push(call)
+    await _write_record(call)
+
+    call.summary = await summarize(call.lines)
+    call.status = "ended"
+    await state.push(call)
+    await _write_record(call)
+    await claims.audit("system", "call.saved", f"Transcript and summary saved ({call.file})",
+                       call_id=call.call_id, claim_id=call.claim_id)
+
+    if call.claim_id and (cl := claims.get(call.claim_id)):
+        if call.mode == "status":
+            cl["followups"].append({"call_id": call.call_id, "time": bank.iso(bank.now()),
+                                    "summary": (call.summary or {}).get("short_summary")})
+            cl["steps"]["followup"] = "done"
+            await claims.save(cl)
+        else:
+            if cl.get("intake_summary") is None:
+                cl["intake_summary"] = call.summary
+            if cl["steps"].get("interview") in ("in_progress", "waiting"):
+                cl["steps"]["interview"] = "done"
+            await claims.save(cl)
+            spawn(brief.generate(cl["id"]))  # Step 3 starts by itself
 
 
-@app.post("/api/settings")
-async def update_settings(body: Settings):
-    for k, v in body.model_dump(exclude_none=True).items():
-        settings[k] = v
-    await broadcast({"type": "settings", "settings": settings})
-    return settings
+async def _write_record(call: Call) -> None:
+    d = state.public(call)
+    path = config.CALLS_DIR / f"{call.call_id}.json"
+    await asyncio.to_thread(path.write_text, json.dumps(d, indent=2, ensure_ascii=False, default=str), "utf-8")
 
 
-def _get(call_id: str) -> Call:
-    if call_id not in calls:
-        raise HTTPException(404, "unknown call")
-    return calls[call_id]
+def _cost(u: dict) -> dict:
+    stt = (u.get("stt_audio_seconds") or 0) / 60 * PRICES["stt_realtime_per_min"]
+    tts = (u.get("tts_characters") or 0) / 1000 * PRICES["tts_per_1k_chars"]
+    llm = (u.get("llm_prompt_tokens") or 0) / 1e6 * PRICES["llm_input_per_m"] + \
+          (u.get("llm_completion_tokens") or 0) / 1e6 * PRICES["llm_output_per_m"]
+    return {"stt": round(stt, 4), "tts": round(tts, 4), "llm": round(llm, 4), "total": round(stt + tts + llm, 4),
+            "note": "estimate at list prices"}
 
 
 # ─────────────────────────── agent -> backend events ───────────────────────────
+@app.post("/internal/calls/{call_id}/otp")
+async def internal_send_otp(call_id: str):
+    """Called by the agent the moment it answers: the OTP SMS goes out instantly, before the greeting."""
+    from .mcp_tools import issue_otp
+    return await issue_otp(_get(call_id), reason="sent automatically when the call connected")
+
+
 class AgentEvent(BaseModel):
     call_id: str
     type: str
@@ -247,69 +339,236 @@ class AgentEvent(BaseModel):
 
 @app.post("/internal/events")
 async def agent_event(ev: AgentEvent):
-    call = calls.get(ev.call_id)
+    call = state.calls.get(ev.call_id)
     if call is None:
         return {"ok": False}
-    d = ev.data
+    d, t = ev.data, ev.type
 
-    if ev.type == "agent.joined":
+    if t == "agent.joined":
         call.status, call.answered_at = "active", time.time()
-    elif ev.type == "customer.live":
-        call.live["customer"] = d.get("text", "")
-    elif ev.type == "ai.live":
-        call.live["ai"] = d.get("text", "")
-    elif ev.type == "line":
-        call.lines.append(d)
-        call.live.pop("customer" if d.get("speaker") == "customer" else "ai", None)
-    elif ev.type == "agent.state":
-        call.agent_state = d.get("state")
-    elif ev.type == "user.state":
-        call.user_state = d.get("state")
-    elif ev.type == "agent.error":
-        call.error = d.get("message")
-    elif ev.type == "agent.warning":
-        await broadcast({"type": "warning", "call_id": call.call_id, "message": d.get("message")})
+        await claims.audit("ai-agent", "call.answered", f"AI agent answered ({call.mode} mode)", call_id=call.call_id,
+                           claim_id=call.claim_id)
+    elif t.endswith(".live"):  # customer.live | ai.live | specialist.live
+        who = t.split(".")[0]
+        text = d.get("text", "") if who == "ai" else claims.mask_pii(d.get("text", ""))
+        call.live[who] = text
+        await hub.broadcast({"type": "live", "call_id": call.call_id, "speaker": who, "text": text})
         return {"ok": True}
-    elif ev.type == "call.summarizing":
-        call.status, call.file, call.live = "wrapping_up", d.get("file"), {}
-        call.ended_at = call.ended_at or time.time()
-    elif ev.type == "call.saved":
-        call.status, call.summary, call.file = "ended", d.get("summary"), d.get("file")
-        call.ended_at = call.ended_at or time.time()
-
-    # Small, frequent events are sent as deltas; state changes send the whole call.
-    if ev.type in ("customer.live", "ai.live"):
-        await broadcast({"type": ev.type, "call_id": call.call_id, "text": d.get("text", "")})
-    elif ev.type == "line":
-        await broadcast({"type": "line", "call_id": call.call_id, "line": d})
-    else:
-        await push_call(call)
+    elif t == "line":
+        # mask what PEOPLE say (OTPs, card/phone numbers); the AI never speaks secrets
+        text = d.get("text", "") if d.get("speaker") == "ai" else claims.mask_pii(d.get("text", ""))
+        line = {**d, "text": text, "index": len(call.lines)}
+        line.setdefault("phase", "interview" if call.phase == "interview" else "ai")
+        call.lines.append(line)
+        call.live.pop(line["speaker"], None)
+        state.persist(call)
+        await hub.broadcast({"type": "line", "call_id": call.call_id, "line": line})
+        if call.phase == "interview" and call.mode == "intake":
+            assist.request_update(call.call_id)
+        return {"ok": True}
+    elif t in ("agent.state", "user.state"):
+        # frequent + only needed live: broadcast, don't write to the database each time
+        if t == "agent.state":
+            call.agent_state = d.get("state")
+        else:
+            call.user_state = d.get("state")
+        await hub.broadcast({"type": "call.updated", "call": state.public(call)})
+        return {"ok": True}
+    elif t == "metrics.turn":
+        call.metrics.setdefault("turns", []).append(d)
+    elif t == "agent.error":
+        call.error = d.get("message")
+    elif t == "agent.warning":
+        await hub.broadcast({"type": "warning", "call_id": call.call_id, "message": d.get("message")})
+        return {"ok": True}
+    elif t == "call.ended":
+        spawn(finalize(call, d))
+        return {"ok": True}
+    await state.push(call)
     return {"ok": True}
 
 
-# ─────────────────────────── console websocket ───────────────────────────
-@app.websocket("/ws/console")
-async def console_ws(ws: WebSocket):
-    await ws.accept()
-    consoles.add(ws)
-    await ws.send_text(
-        json.dumps(
-            {
-                "type": "snapshot",
-                "settings": settings,
-                "calls": [c.model_dump() for c in calls.values()],
-            }
-        )
-    )
-    try:
-        while True:
-            await ws.receive_text()  # keep-alive pings from the browser
-    except WebSocketDisconnect:
-        pass
-    finally:
-        consoles.discard(ws)
+# ─────────────────────────── claims (Step 3) ───────────────────────────
+def _claim_view(cl: dict) -> dict:
+    v = claims.with_clock(cl)
+    v["call_details"] = [state.public(state.calls[c]) for c in cl["calls"] if c in state.calls]
+    v["audit"] = sorted(claims.audit_for(claim_id=cl["id"]) +
+                        [a for c in cl["calls"] for a in claims.audit_for(call_id=c) if not a.get("claim_id")],
+                        key=lambda a: a["time"])
+    v["security_log"] = bank.security_log_for(cl["customer_id"])
+    turns = [t for c in v["call_details"] for t in c["metrics"].get("turns", []) if t.get("total")]
+    v["metrics"] = _latency(turns)
+    v["metrics"]["cost_usd"] = round(sum((c["metrics"].get("cost_usd") or {}).get("total", 0)
+                                         for c in v["call_details"]), 4)
+    return v
+
+
+def _latency(turns: list[dict]) -> dict:
+    vals = sorted(t["total"] for t in turns)
+    if not vals:
+        return {"turns": 0, "p50": None, "p95": None}
+    pick = lambda q: vals[min(len(vals) - 1, int(round(q * (len(vals) - 1))))]  # noqa: E731
+    return {"turns": len(vals), "p50": round(pick(0.5), 2), "p95": round(pick(0.95), 2)}
+
+
+@app.get("/api/claims")
+async def list_claims():
+    return [claims.with_clock(c) for c in claims.list_all()]
+
+
+@app.get("/api/claims/{claim_id}")
+async def get_claim(claim_id: str):
+    cl = claims.get(claim_id)
+    if not cl:
+        raise HTTPException(404, "unknown claim")
+    return _claim_view(cl)
+
+
+@app.post("/api/claims/{claim_id}/brief")
+async def make_brief(claim_id: str):
+    if not claims.get(claim_id):
+        raise HTTPException(404, "unknown claim")
+    spawn(brief.generate(claim_id))
+    return {"ok": True}
+
+
+class Decision(BaseModel):
+    outcome: str  # refund_approved | declined | more_info
+    notes: str = ""
+    analyst: str = "Fraud Analyst"
+
+
+@app.post("/api/claims/{claim_id}/decision")
+async def decide(claim_id: str, body: Decision):
+    async with _decide_locks.setdefault(claim_id, asyncio.Lock()):
+        return await _decide(claim_id, body)
+
+
+_decide_locks: dict[str, asyncio.Lock] = {}
+
+
+async def _decide(claim_id: str, body: Decision):
+    cl = claims.get(claim_id)
+    if not cl:
+        raise HTTPException(404, "unknown claim")
+    if cl.get("refund"):
+        raise HTTPException(409, "This claim is already refunded; the decision is final.")
+    if (cl.get("decision") or {}).get("outcome") == "declined" and body.outcome != "more_info":
+        raise HTTPException(409, "This claim was already declined; the decision is final.")
+    cl["decision"] = {**body.model_dump(), "time": bank.iso(bank.now())}
+    cl["status"] = "decided" if body.outcome != "more_info" else "investigation"
+    cl["steps"]["investigate"] = "decided" if body.outcome != "more_info" else "brief_ready"
+    await claims.save(cl)
+    await claims.audit("analyst", "decision.recorded", f"{body.outcome}: {body.notes}", claim_id=claim_id)
+    words = {"refund_approved": "has been approved for a refund", "declined": "has been reviewed and declined",
+             "more_info": "needs a little more information"}
+    await send_sms(cl["phone"], f"Northbridge Bank: your claim {cl['reference']} {words.get(body.outcome, 'was updated')}. "
+                   "Call us any time for details.", claim_id=claim_id)
+    if body.outcome == "refund_approved":
+        # simulate the money actually going back (approval alone does not move money)
+        r = bank.credit_refund(cl["customer_id"], int(cl["total_disputed"]), cl["reference"],
+                               [t["id"] for t in cl["disputed_transactions"]])
+        cl["refund"] = r
+        cl["status"] = "refunded"
+        cl["steps"]["followup"] = cl["steps"].get("followup", "pending")
+        await claims.save(cl)
+        await claims.audit("system", "refund.credited",
+                           f"INR {r['amount']:,} credited to account ending {r['account_last4']}", claim_id=claim_id)
+        await send_sms(cl["phone"], f"Northbridge Bank: INR {r['amount']:,} has been credited to your account ending "
+                       f"{r['account_last4']} (refund for claim {cl['reference']}). Available balance: INR {r['new_balance']:,}.",
+                       claim_id=claim_id)
+    return _claim_view(cl)
+
+
+# ─────────────────────────── misc ───────────────────────────
+@app.get("/api/calls")
+async def list_calls():
+    return [state.public(c) for c in sorted(state.calls.values(), key=lambda c: -c.created_at)]
+
+
+@app.get("/api/calls/{call_id}/record")
+async def call_record(call_id: str):
+    return state.public(_get(call_id))
+
+
+@app.get("/api/calls/{call_id}/audio")
+async def call_audio(call_id: str):
+    call = _get(call_id)
+    if not call.audio_file or not (config.AUDIO_DIR / call.audio_file).exists():
+        raise HTTPException(404, "no recording")
+    return FileResponse(config.AUDIO_DIR / call.audio_file, media_type="audio/wav")
+
+
+@app.get("/api/sms")
+async def list_sms(phone: str = ""):
+    key = bank.norm_phone(phone)
+    return [s for s in db.all("sms") if not key or bank.norm_phone(s["phone"]) == key]
+
+
+@app.get("/api/bank/customers")
+async def customers():
+    return db.all("customers")
+
+
+@app.get("/api/bank/customers/{customer_id}/transactions")
+async def customer_transactions(customer_id: str):
+    """For the customer's phone banking app (synthetic data)."""
+    return bank.transactions_for(customer_id, hours=24 * 7)
+
+
+@app.get("/api/playbook")
+async def playbook(jurisdiction: str = config.JURISDICTION):
+    return playbooks.get(jurisdiction)
+
+
+class Settings(BaseModel):
+    auto_answer: bool | None = None
+    auto_specialist: bool | None = None  # Step 2: the simulated specialist joins by itself after the handover
+    ring_seconds: float | None = None
+
+
+@app.post("/api/settings")
+async def update_settings(body: Settings):
+    for k, v in body.model_dump(exclude_none=True).items():
+        settings[k] = v
+    await hub.broadcast({"type": "settings", "settings": settings})
+    return settings
+
+
+@app.post("/api/admin/reset")
+async def reset_demo():
+    """Wipe calls, claims, SMS and audit; re-seed the synthetic bank."""
+    for cid, call in list(state.calls.items()):
+        sim_specialist.stop(cid)
+        if call.status in ("ringing", "connecting", "active", "wrapping_up"):
+            await _delete_room(call)  # end live calls too, so no old AI agent keeps running after a reset
+    db.wipe()
+    state.calls.clear()
+    bank.seed()
+    await hub.broadcast({"type": "reset"})
+    return {"ok": True}
 
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "mistral_key_loaded": bool(config.MISTRAL_API_KEY)}
+    return {"ok": True, "mistral_key_loaded": bool(config.MISTRAL_API_KEY), "jurisdiction": config.JURISDICTION}
+
+
+@app.websocket("/ws/console")
+async def console_ws(ws: WebSocket):
+    await ws.accept()
+    hub.clients.add(ws)
+    await ws.send_text(json.dumps({
+        "type": "snapshot",
+        "settings": settings,
+        "calls": [state.public(c) for c in state.calls.values()],
+        "claims": [claims.with_clock(c) for c in claims.list_all()],
+        "sms": db.all("sms")[-50:],
+    }, default=str))
+    try:
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        hub.clients.discard(ws)

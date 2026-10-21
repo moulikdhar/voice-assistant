@@ -58,3 +58,31 @@ export function endTone(): void {
 export function unlockAudio(): void {
   audio();
 }
+
+/** Two-note "ding" for an incoming text message. */
+export function smsTone(): void {
+  try {
+    const ac = audio();
+    const out = ac.createGain();
+    out.gain.value = 0.6;
+    out.connect(ac.destination);
+    const t = ac.currentTime + 0.02;
+    burst(ac, out, [1318], t, 0.12);
+    burst(ac, out, [1760], t + 0.14, 0.2);
+  } catch { /* audio not unlocked yet */ }
+}
+
+/** Short keypad (DTMF) tone. */
+const DTMF: Record<string, [number, number]> = {
+  "1": [697, 1209], "2": [697, 1336], "3": [697, 1477], "4": [770, 1209], "5": [770, 1336], "6": [770, 1477],
+  "7": [852, 1209], "8": [852, 1336], "9": [852, 1477], "*": [941, 1209], "0": [941, 1336], "#": [941, 1477],
+};
+export function keyTone(k: string): void {
+  try {
+    const ac = audio();
+    const out = ac.createGain();
+    out.gain.value = 0.5;
+    out.connect(ac.destination);
+    burst(ac, out, DTMF[k] ?? [941, 1336], ac.currentTime + 0.01, 0.12);
+  } catch { /* ignore */ }
+}

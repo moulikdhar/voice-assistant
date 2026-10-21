@@ -25,4 +25,5 @@ Voxtral TTS : the mouth. Turns the AI's reply into a natural human voice.
  Silero VAD (small free model) 
  The speech detector. Tells LiveKit "a human is speaking right now" or "silence", which drives turn-taking and barge-in.
 
-4 8 2 1 9 0
+instruction : asha's voice, otp thing - voice in env (no repetative - prompts)
+after oliver - add human hand over (suppose manager) - escalate
