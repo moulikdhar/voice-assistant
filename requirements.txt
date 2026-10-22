@@ -11,7 +11,7 @@ livekit-api==1.2.2               # create tokens, dispatch agents, delete rooms
 mcp==2.2.0
 
 # ── Mistral SDK (Transcribe V2 batch, Mistral Large JSON: summary, assist, brief) ──
-mistralai==2.10.1
+mistralai==2.10.1 
 
 # ── Backend web server (call controller + live events + claims API) ──
 fastapi==0.143.2
