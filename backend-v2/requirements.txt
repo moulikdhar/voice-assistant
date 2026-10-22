@@ -1,0 +1,16 @@
+# Backend v2 + voice agent in ONE process. Install into its own venv:
+#   python -m venv .venv-v2 && .venv-v2\Scripts\pip install -r backend-v2\requirements.txt
+
+# ── Mistral SDK: managed voice sessions (turn-taking, barge-in, Voxtral STT/TTS, LLM, tool RPC),
+#    Voxtral Realtime (interview channels), Transcribe V2 (batch), Mistral Large JSON (summary, assist, brief).
+#    The voice-agents extra brings livekit (the rtc client: our bridge into the call's room) and numpy. ──
+mistralai[voice-agents,realtime]==3.3.0
+
+# ── Backend web server (call controller + live events + claims API) ──
+fastapi==0.143.2
+uvicorn[standard]==0.53.0
+httpx==0.28.1                    # LiveKit room deletion (Twirp)
+python-dotenv==1.2.3             # loads MISTRAL_API_KEY from .env
+
+# NOT needed any more: livekit-agents, livekit-plugins-mistralai, livekit-plugins-silero, livekit-api, mcp.
+# Still needed: the LiveKit server binary (`livekit-server --dev`) as the browser's phone line.

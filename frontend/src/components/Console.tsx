@@ -221,8 +221,11 @@ export function Transcript({ call, warning, compact }: { call: Call; warning?: {
   }, [call.lines.length, call.live.customer, call.live.ai, call.live.specialist]);
 
   const liveBubbles = useMemo(
-    () => (["ai", "specialist", "customer"] as Speaker[]).filter((s) => call.live[s]).map((s) => ({ speaker: s, text: call.live[s]! })),
-    [call.live.ai, call.live.customer, call.live.specialist],
+    // once the specialist is on the line the AI is silent: never show a (stale) "AI assistant" live bubble
+    () => (["ai", "specialist", "customer"] as Speaker[])
+      .filter((s) => call.live[s] && !(s === "ai" && call.phase === "interview"))
+      .map((s) => ({ speaker: s, text: call.live[s]! })),
+    [call.live.ai, call.live.customer, call.live.specialist, call.phase],
   );
   const handoverAt = call.lines.findIndex((l) => l.phase === "interview");
 

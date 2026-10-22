@@ -9,3 +9,7 @@ frontend/dist/
 *.tsbuildinfo
 tools/livekit-server.exe
 _backup_*/
+
+# backend v2
+.venv-v2/
+backend-v2/calls/
